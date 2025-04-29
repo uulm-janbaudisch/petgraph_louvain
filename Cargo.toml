@@ -1,0 +1,9 @@
+[package]
+name = "petgraph_louvain"
+description = "An implementation of the Louvain method for petgraph."
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+petgraph = "0.8"
