@@ -1,6 +1,10 @@
-use petgraph::graph::{IndexType, NodeIndex};
-use petgraph::{Graph, Undirected};
+use petgraph::adj::IndexType;
+use petgraph::graph::NodeIndex;
+use petgraph::matrix_graph::MatrixGraph;
+use petgraph::visit::IntoNodeIdentifiers;
+use petgraph::Undirected;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::BuildHasher;
 
 /// Uses the [Louvain method][louvain] to find communities.
 ///
@@ -12,10 +16,13 @@ use std::collections::{BTreeMap, BTreeSet};
 ///
 /// [louvain]: https://en.wikipedia.org/wiki/Louvain_method
 /// [dendrogram]: https://en.wikipedia.org/wiki/Dendrogram
-pub fn louvain<N, E, Ix>(graph: &Graph<N, E, Undirected, Ix>) -> Vec<Vec<Vec<NodeIndex<Ix>>>>
+pub fn louvain<N, E, S, Ix>(
+    graph: &MatrixGraph<N, E, S, Undirected, Option<E>, Ix>,
+) -> Vec<Vec<Vec<NodeIndex<Ix>>>>
 where
+    E: Copy + Into<f64> + std::iter::Sum<E>,
     N: Default,
-    E: Copy + Into<f64> + std::iter::Sum,
+    S: BuildHasher + Default,
     Ix: IndexType,
 {
     let mut louvain = Louvain::new(graph);
@@ -53,13 +60,9 @@ where
 }
 
 /// Data structure to control the process of the louvain method.
-#[derive(Debug)]
-struct Louvain<'a, N, E, Ix>
-where
-    Ix: IndexType,
-{
+struct Louvain<'a, N, E, S, Ix> {
     /// The graph the algorithm operates on.
-    graph: &'a Graph<N, E, Undirected, Ix>,
+    graph: &'a MatrixGraph<N, E, S, Undirected, Option<E>, Ix>,
     /// Nodes in each community.
     communities: Vec<BTreeSet<NodeIndex<Ix>>>,
     /// Community memberships of each node.
@@ -72,42 +75,36 @@ where
     sigma_tot: Vec<f64>,
 }
 
-impl<'a, N, E, Ix> Louvain<'a, N, E, Ix>
+impl<'a, N, E, S, Ix> Louvain<'a, N, E, S, Ix>
 where
+    E: Copy + Into<f64> + std::iter::Sum<E>,
     N: Default,
-    E: Copy + Into<f64> + std::iter::Sum,
+    S: BuildHasher + Default,
     Ix: IndexType,
 {
-    pub fn new(graph: &'a Graph<N, E, Undirected, Ix>) -> Self {
+    pub fn new(graph: &'a MatrixGraph<N, E, S, Undirected, Option<E>, Ix>) -> Self {
         // Initially, each node forms its own community.
         let communities = graph
-            .node_indices()
+            .node_identifiers()
             .map(|node| BTreeSet::from([node]))
             .collect();
 
         let memberships = graph
-            .node_indices()
+            .node_identifiers()
             .enumerate()
             .map(|(community, node)| (node, community))
             .collect();
 
-        // Weight of all edges.
-        let m: E = graph.edge_weights().copied().sum();
-
         // Weight of each edge incident to a node.
         let node_weights: Vec<f64> = graph
             // Consider each node.
-            .node_indices()
+            .node_identifiers()
             .map(|node| {
                 // Get all neighbors of a node ...
                 graph
-                    .neighbors(node)
-                    // and sum the weight of their link.
-                    .map(|neighbor| {
-                        *graph
-                            .edge_weight(graph.find_edge(node, neighbor).unwrap())
-                            .unwrap()
-                    })
+                    .edges(node)
+                    .map(|(_a, _b, weight)| weight)
+                    .copied()
                     .sum::<E>()
                     .into()
             })
@@ -117,7 +114,7 @@ where
             graph,
             communities,
             memberships,
-            two_m: m.into() * 2f64,
+            two_m: node_weights.iter().sum::<f64>(),
             // As each node forms its own community, the total weight of these communities is the
             // respective node weight.
             sigma_tot: node_weights.clone(),
@@ -143,7 +140,7 @@ where
     /// Communities can be extracted via [communities][Self::communities].
     fn optimize(&mut self) -> bool {
         // Take a copy of the nodes to iterate over them.
-        let nodes: Vec<NodeIndex<Ix>> = self.graph.node_indices().collect();
+        let nodes: Vec<NodeIndex<Ix>> = self.graph.node_identifiers().collect();
 
         // Flag for tracking whether any optimization took place.
         let mut optimized = false;
@@ -168,7 +165,7 @@ where
     /// Phase 2: Community Aggregation
     ///
     /// Creates a new graph in which each community is represented by a single node.
-    fn aggregate(&self) -> Graph<N, E, Undirected, Ix> {
+    fn aggregate(&self) -> MatrixGraph<N, E, S, Undirected, Option<E>, Ix> {
         // Create a copy of the communities to iterate over them.
         let communities = self.communities();
 
@@ -191,10 +188,15 @@ where
                                 .iter()
                                 // ... whether it has an edge to the other community.
                                 .filter_map(move |&node_of_other| {
-                                    self.graph.find_edge(node_of_community, node_of_other)
+                                    if self.graph.has_edge(node_of_community, node_of_other) {
+                                        return Some(
+                                            self.graph
+                                                .edge_weight(node_of_community, node_of_other),
+                                        );
+                                    }
+
+                                    None
                                 })
-                                // If so, take the edge weight.
-                                .map(|edge| self.graph.edge_weight(edge).unwrap())
                         })
                         .copied()
                         .peekable();
@@ -208,7 +210,7 @@ where
                 })
         });
 
-        Graph::from_edges(edges)
+        MatrixGraph::from_edges(edges)
     }
 
     /// `k_i,in`: Weight of edges from a node into a community.
@@ -218,8 +220,13 @@ where
         self.communities[community]
             .iter()
             .filter(|&&other| other != node)
-            .filter_map(|&other| self.graph.find_edge(node, other))
-            .map(|edge| self.graph.edge_weight(edge).unwrap())
+            .filter_map(|&other| {
+                if self.graph.has_edge(node, other) {
+                    return Some(self.graph.edge_weight(node, other));
+                }
+
+                None
+            })
             .copied()
             .sum::<E>()
             .into()
@@ -350,19 +357,15 @@ where
 mod test {
     use super::louvain;
     use petgraph::graph::NodeIndex;
-    use petgraph::{Graph, Undirected};
+    use petgraph::matrix_graph::MatrixGraph;
+    use petgraph::Undirected;
+    use std::hash::RandomState;
 
     /// Generates the example graph from the [Louvain paper][paper].
     ///
     /// [paper]: https://perso.uclouvain.be/vincent.blondel/publications/08BG.pdf
-    fn graph() -> Graph<u8, u8, Undirected> {
-        let mut graph = Graph::<u8, u8, Undirected>::new_undirected();
-
-        for i in 0..=15 {
-            graph.add_node(i);
-        }
-
-        graph.extend_with_edges(
+    fn graph() -> MatrixGraph<(), u8, RandomState, Undirected, Option<u8>, u8> {
+        MatrixGraph::from_edges(
             [
                 (0, 2),
                 (0, 3),
@@ -394,11 +397,8 @@ mod test {
                 (11, 13),
             ]
             .iter()
-            .map(|(a, b)| (*a, *b, 1))
-            .collect::<Vec<_>>(),
-        );
-
-        graph
+            .map(|(a, b)| (*a, *b, 1)),
+        )
     }
 
     #[test]
