@@ -6,4 +6,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-petgraph = "0.8"
+petgraph = { git = "https://github.com/uulm-janbaudisch/petgraph.git", branch = "csr-from-edges-undirected" }
